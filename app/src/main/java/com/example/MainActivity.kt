@@ -2,11 +2,14 @@ package com.example
 
 import android.net.Uri
 import android.os.Bundle
-import android.widget.VideoView
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.media3.common.MediaItem
+import androidx.media3.common.Player
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.ui.PlayerView
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -64,6 +67,10 @@ data class GenerationHistory(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun VizionAIApp() {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val sharedPrefs = remember { context.getSharedPreferences("vizionai_settings", android.content.Context.MODE_PRIVATE) }
+    var replicateKey by remember { mutableStateOf(sharedPrefs.getString("replicate_key", "") ?: "") }
+    
     val coroutineScope = rememberCoroutineScope()
     var prompt by remember { mutableStateOf("") }
     var ratio by remember { mutableStateOf("16:9") }
@@ -71,6 +78,7 @@ fun VizionAIApp() {
     var progress by remember { mutableFloatStateOf(0f) }
     var message by remember { mutableStateOf("") }
     var videoUrl by remember { mutableStateOf<String?>(null) }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
     
     var showDirector by remember { mutableStateOf(false) }
     var showHistory by remember { mutableStateOf(false) }
@@ -80,31 +88,33 @@ fun VizionAIApp() {
 
     val handleGenerate = {
         if (prompt.isNotBlank() && status != "loading") {
-            status = "loading"
-            progress = 0f
-            videoUrl = null
-            coroutineScope.launch {
-                val workflow = listOf(
-                    "Analyzing creative vectors...",
-                    "Configuring matrix parameters...",
-                    "Rendering high-fidelity frames...",
-                    "Applying spatial contrast..."
-                )
-                for ((index, msg) in workflow.withIndex()) {
-                    message = msg
-                    for (p in 1..20) {
-                        delay(40)
-                        progress = (index * 0.25f) + (p * 0.0125f)
+            if (replicateKey.isBlank()) {
+                errorMessage = "Please configure your Replicate API Key in Settings."
+                showSettings = true
+            } else {
+                status = "loading"
+                progress = 0f
+                videoUrl = null
+                errorMessage = null
+                coroutineScope.launch {
+                    try {
+                        val url = ReplicateApi.generateVideo(prompt, replicateKey) { msg, prog ->
+                            message = msg
+                            progress = prog
+                        }
+                        videoUrl = url
+                        status = "success"
+                        historyList.add(0, GenerationHistory(
+                            id = UUID.randomUUID().toString(),
+                            prompt = prompt,
+                            ratio = ratio,
+                            timestamp = System.currentTimeMillis()
+                        ))
+                    } catch (e: Exception) {
+                        status = "idle"
+                        errorMessage = "Generation Error: ${e.message}"
                     }
                 }
-                status = "success"
-                videoUrl = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"
-                historyList.add(0, GenerationHistory(
-                    id = UUID.randomUUID().toString(),
-                    prompt = prompt,
-                    ratio = ratio,
-                    timestamp = System.currentTimeMillis()
-                ))
             }
         }
     }
@@ -179,7 +189,18 @@ fun VizionAIApp() {
                 .padding(16.dp),
             contentAlignment = Alignment.Center
         ) {
-            CanvasPreview(status, progress, message, videoUrl, ratio)
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                if (errorMessage != null) {
+                    Text(
+                        text = errorMessage!!,
+                        color = MaterialTheme.colorScheme.error,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(bottom = 12.dp)
+                    )
+                }
+                CanvasPreview(status, progress, message, videoUrl, ratio)
+            }
         }
     }
 
@@ -209,7 +230,16 @@ fun VizionAIApp() {
             containerColor = BgSecondary,
             dragHandle = { BottomSheetDefaults.DragHandle(color = BorderColor) }
         ) {
-            SettingsPanel()
+            SettingsPanel(
+                initialKey = replicateKey,
+                onSave = { newKey ->
+                    replicateKey = newKey
+                    sharedPrefs.edit().putString("replicate_key", newKey).apply()
+                    showSettings = false
+                    errorMessage = null
+                },
+                onDismiss = { showSettings = false }
+            )
         }
     }
 }
@@ -264,15 +294,36 @@ fun CanvasPreview(status: String, progress: Float, message: String, videoUrl: St
             }
             "success" -> {
                 if (videoUrl != null) {
+                    val context = androidx.compose.ui.platform.LocalContext.current
+                    val exoPlayer = remember(videoUrl) {
+                        ExoPlayer.Builder(context).build().apply {
+                            setMediaItem(MediaItem.fromUri(Uri.parse(videoUrl)))
+                            repeatMode = Player.REPEAT_MODE_ALL
+                            prepare()
+                            playWhenReady = true
+                        }
+                    }
+                    
+                    DisposableEffect(exoPlayer) {
+                        onDispose {
+                            exoPlayer.release()
+                        }
+                    }
+
                     AndroidView(
-                        factory = { context ->
-                            VideoView(context).apply {
-                                setVideoURI(Uri.parse(videoUrl))
-                                setOnPreparedListener { mp ->
-                                    mp.isLooping = true
-                                    start()
-                                }
+                        factory = { ctx ->
+                            PlayerView(ctx).apply {
+                                player = exoPlayer
+                                useController = true
+                                resizeMode = androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIT
+                                layoutParams = android.view.ViewGroup.LayoutParams(
+                                    android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                                    android.view.ViewGroup.LayoutParams.MATCH_PARENT
+                                )
                             }
+                        },
+                        update = { playerView ->
+                            playerView.player = exoPlayer
                         },
                         modifier = Modifier.fillMaxSize()
                     )
@@ -600,7 +651,9 @@ fun HistoryPanel(historyList: List<GenerationHistory>) {
 }
 
 @Composable
-fun SettingsPanel() {
+fun SettingsPanel(initialKey: String, onSave: (String) -> Unit, onDismiss: () -> Unit) {
+    var key by remember { mutableStateOf(initialKey) }
+    
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -612,8 +665,7 @@ fun SettingsPanel() {
         Divider(color = BorderColor)
         Spacer(modifier = Modifier.height(16.dp))
         
-        SettingsInput("REPLICATE ENGINE API KEY", "r8_••••••••••••••••••••••••")
-        SettingsInput("ANTHROPIC CORE API TOKEN", "sk-ant-••••••••••••••••••••")
+        SettingsInput("REPLICATE ENGINE API KEY", "r8_••••••••••••••••••••••••", key) { key = it }
         
         Spacer(modifier = Modifier.height(16.dp))
         Divider(color = BorderColor)
@@ -624,7 +676,7 @@ fun SettingsPanel() {
             horizontalArrangement = Arrangement.End
         ) {
             OutlinedButton(
-                onClick = { },
+                onClick = onDismiss,
                 colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White),
                 border = BorderStroke(1.dp, BorderColor),
                 shape = RoundedCornerShape(6.dp)
@@ -633,7 +685,7 @@ fun SettingsPanel() {
             }
             Spacer(modifier = Modifier.width(8.dp))
             Button(
-                onClick = { },
+                onClick = { onSave(key) },
                 colors = ButtonDefaults.buttonColors(containerColor = AccentColor, contentColor = Color.Black),
                 shape = RoundedCornerShape(6.dp)
             ) {
@@ -644,13 +696,13 @@ fun SettingsPanel() {
 }
 
 @Composable
-fun SettingsInput(label: String, placeholder: String) {
+fun SettingsInput(label: String, placeholder: String, value: String, onValueChange: (String) -> Unit) {
     Column(modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp)) {
         Text(label, color = TextSecondary, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
         Spacer(modifier = Modifier.height(8.dp))
         BasicTextField(
-            value = "",
-            onValueChange = {},
+            value = value,
+            onValueChange = onValueChange,
             textStyle = TextStyle(color = Color.White, fontSize = 12.sp, fontFamily = FontFamily.Monospace),
             cursorBrush = SolidColor(AccentColor),
             decorationBox = { innerTextField ->
@@ -661,7 +713,9 @@ fun SettingsInput(label: String, placeholder: String) {
                         .background(Color(0xFF0D0D0D))
                         .padding(horizontal = 12.dp, vertical = 10.dp)
                 ) {
-                    Text(placeholder, color = TextSecondary, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+                    if (value.isEmpty()) {
+                        Text(placeholder, color = TextSecondary, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+                    }
                     innerTextField()
                 }
             }
